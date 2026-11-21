@@ -1,0 +1,108 @@
+package com.example.autocut
+
+import android.content.ContentValues
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import java.io.File
+import kotlin.concurrent.thread
+
+class MainActivity : AppCompatActivity() {
+
+    private var videoUri: Uri? = null
+    private var grade = Grade()
+
+    private lateinit var tvVideo: TextView
+    private lateinit var tvXml: TextView
+    private lateinit var tvStatus: TextView
+    private lateinit var progress: ProgressBar
+    private lateinit var btnStart: Button
+    private lateinit var videoView: VideoView
+
+    private val pickVideo = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) { videoUri = uri; tvVideo.text = "বাছা হয়েছে: ${uri.lastPathSegment}" }
+    }
+
+    private val pickXml = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        try {
+            contentResolver.openInputStream(uri)!!.use { grade = Grade.parse(it) }
+            tvXml.text = if (grade.isNeutral) "XML পড়া হয়েছে, কিন্তু কালার ভ্যালু পাওয়া যায়নি"
+            else "কালার: exposure=${grade.exposure}, gamma=${grade.gamma}, saturation=${grade.saturation}"
+        } catch (e: Exception) {
+            tvXml.text = "XML পড়া যায়নি: ${e.message}"
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        tvVideo = findViewById(R.id.tvVideo)
+        tvXml = findViewById(R.id.tvXml)
+        tvStatus = findViewById(R.id.tvStatus)
+        progress = findViewById(R.id.progress)
+        btnStart = findViewById(R.id.btnStart)
+        videoView = findViewById(R.id.videoView)
+
+        findViewById<Button>(R.id.btnVideo).setOnClickListener { pickVideo.launch(arrayOf("video/*")) }
+        findViewById<Button>(R.id.btnXml).setOnClickListener { pickXml.launch(arrayOf("text/xml", "application/xml", "*/*")) }
+        btnStart.setOnClickListener { start() }
+    }
+
+    private fun start() {
+        val uri = videoUri ?: run { toast("আগে ভিডিও বাছুন"); return }
+        // খালি = অটো মোড (রেকর্ডিংয়ের নয়েজ দেখে নিজে সীমা ঠিক করে)
+        val noise = findViewById<EditText>(R.id.etNoise).text.toString().toIntOrNull()
+        val fast = findViewById<CheckBox>(R.id.cbFast).isChecked
+        val gap = findViewById<EditText>(R.id.etGap).text.toString().toDoubleOrNull() ?: 0.5
+        val black = (findViewById<EditText>(R.id.etBlack).text.toString().toDoubleOrNull() ?: 0.5)
+            .coerceIn(0.1, 0.9)
+        btnStart.isEnabled = false
+        progress.progress = 0
+
+        thread {
+            try {
+                val out = Processor(this).process(
+                    uri, grade, noise, gap.coerceAtLeast(0.3), black, fast,
+                    onStatus = { s -> runOnUiThread { tvStatus.text = s } },
+                    onProgress = { p -> runOnUiThread { progress.progress = p } }
+                )
+                val saved = save(out)
+                runOnUiThread {
+                    tvStatus.text = "সম্পন্ন! গ্যালারির Movies/AutoCut ফোল্ডারে সেভ হয়েছে।"
+                    videoView.setVideoURI(saved)
+                    videoView.setMediaController(MediaController(this))
+                    videoView.start()
+                    btnStart.isEnabled = true
+                }
+            } catch (e: Exception) {
+                runOnUiThread { tvStatus.text = "ত্রুটি: ${e.message}"; btnStart.isEnabled = true }
+            }
+        }
+    }
+
+    private fun save(file: File): Uri {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val cv = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/AutoCut")
+            }
+            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv)!!
+            contentResolver.openOutputStream(uri)!!.use { o -> file.inputStream().use { it.copyTo(o) } }
+            file.delete()
+            return uri
+        }
+        val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)!!
+        val dest = File(dir, file.name)
+        file.copyTo(dest, overwrite = true); file.delete()
+        return Uri.fromFile(dest)
+    }
+
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+}

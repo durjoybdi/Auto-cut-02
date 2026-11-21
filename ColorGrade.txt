@@ -1,0 +1,62 @@
+package com.example.autocut
+
+import org.w3c.dom.Element
+import java.io.InputStream
+import java.util.Locale
+import javax.xml.parsers.DocumentBuilderFactory
+import kotlin.math.pow
+
+/** Alight Motion XML থেকে পড়া কালার গ্রেডিং ভ্যালু। */
+data class Grade(
+    val exposure: Float = 0f,
+    val gamma: Float = 1f,
+    val saturation: Float = 1f
+) {
+    val isNeutral get() = exposure == 0f && gamma == 1f && saturation == 1f
+
+    /** FFmpeg ফিল্টার চেইন (খালি হলে কিছু করার নেই) */
+    fun toFilter(): String {
+        val parts = mutableListOf<String>()
+        if (exposure != 0f) {
+            val m = String.format(Locale.US, "%.4f", 2.0.pow(exposure.toDouble()))
+            // YUV-তেই কাজ করে (RGB রূপান্তর নেই), তাই দ্রুত
+            parts += "lutyuv=y='clip(val*$m,16,235)'"
+        }
+        if (gamma != 1f || saturation != 1f) {
+            parts += "eq=gamma=$gamma:saturation=$saturation"
+        }
+        return parts.joinToString(",")
+    }
+
+    companion object {
+        fun parse(stream: InputStream): Grade {
+            val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(stream)
+            val shapes = doc.getElementsByTagName("shape")
+            for (i in 0 until shapes.length) {
+                val shape = shapes.item(i) as Element
+                if (shape.getAttribute("fillType") != "media") continue
+                var exposure = 0f
+                var gamma = 1f
+                var sat = 1f
+                val kids = shape.childNodes
+                for (k in 0 until kids.length) {
+                    val eff = kids.item(k) as? Element ?: continue
+                    if (eff.tagName != "effect") continue
+                    val id = eff.getAttribute("id")
+                    val props = eff.getElementsByTagName("property")
+                    for (p in 0 until props.length) {
+                        val pe = props.item(p) as Element
+                        val v = pe.getAttribute("value").toFloatOrNull() ?: continue
+                        when {
+                            id.endsWith("exposure") && pe.getAttribute("name") == "exposure" -> exposure = v
+                            id.endsWith("exposure") && pe.getAttribute("name") == "gamma" -> gamma = v
+                            id.endsWith("satvib") && pe.getAttribute("name") == "saturation" -> sat = v
+                        }
+                    }
+                }
+                return Grade(exposure, gamma, sat)
+            }
+            return Grade()
+        }
+    }
+}

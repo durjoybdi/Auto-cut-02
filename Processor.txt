@@ -1,0 +1,275 @@
+package com.example.autocut
+
+import android.content.Context
+import android.net.Uri
+import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.FFmpegKitConfig
+import com.arthenica.ffmpegkit.FFprobeKit
+import com.arthenica.ffmpegkit.ReturnCode
+import java.io.File
+import java.io.FileInputStream
+import java.util.Locale
+import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
+
+class Processor(private val ctx: Context) {
+
+    data class Seg(val s: Double, val e: Double)
+
+    private fun f(v: Double) = String.format(Locale.US, "%.3f", v)
+
+    // প্রতিবার নতুন SAF প্যারামিটার (একই স্ট্রিং বারবার ব্যবহার করলে কিছু ডিভাইসে ফাইল খোলে না)
+    private fun src(uri: Uri): String = FFmpegKitConfig.getSafParameterForRead(ctx, uri)
+
+    /**
+     * ১) অডিও বিশ্লেষণ করে কথার অংশ খোঁজে (নয়েজ অনুযায়ী নিজে থেকে সীমা ঠিক করে)
+     * ২) শুধু কথার অংশগুলো রাখে, ফাঁকা অংশ কাটে
+     * ৩) প্রতি কাটে ব্ল্যাক বসায়  ৪) কালার গ্রেডিং লাগিয়ে এক্সপোর্ট করে
+     *
+     * noiseDb == null হলে অটো মোড।
+     */
+    fun process(
+        input: Uri,
+        grade: Grade,
+        noiseDb: Int?,
+        minGap: Double,
+        blackSec: Double,
+        fast720: Boolean,
+        onStatus: (String) -> Unit,
+        onProgress: (Int) -> Unit
+    ): File {
+
+        // ---------- ১. ভিডিওর তথ্য ----------
+        onStatus("ভিডিও বিশ্লেষণ হচ্ছে…")
+        val info = FFprobeKit.getMediaInformation(src(input)).mediaInformation
+            ?: error("ভিডিও পড়া যায়নি")
+        val duration = info.duration?.toDoubleOrNull() ?: error("ভিডিওর দৈর্ঘ্য পাওয়া যায়নি")
+        val vs = info.streams.firstOrNull { it.type == "video" } ?: error("ভিডিও স্ট্রিম নেই")
+        if (info.streams.none { it.type == "audio" }) error("ভিডিওতে অডিও নেই")
+
+        var w = (vs.width ?: 0L).toInt()
+        var h = (vs.height ?: 0L).toInt()
+        val props = vs.allProperties
+        var rot = props?.optJSONArray("side_data_list")?.optJSONObject(0)?.optInt("rotation", 0) ?: 0
+        if (rot == 0) rot = props?.optJSONObject("tags")?.optString("rotate")?.toIntOrNull() ?: 0
+        if (Math.abs(rot) % 180 == 90) { val t = w; w = h; h = t }
+
+        // দ্রুত মোড: ছোট দিক ৭২০ পিক্সেলের বেশি হলে নামিয়ে আনা
+        if (fast720 && min(w, h) > 720) {
+            if (w >= h) { w = (w * 720.0 / h).toInt(); h = 720 }
+            else { h = (h * 720.0 / w).toInt(); w = 720 }
+        }
+        w = w and 1.inv(); h = h and 1.inv()
+
+        var fps = vs.averageFrameRate ?: "30"
+        if (fps.startsWith("0") || !fps.matches(Regex("[0-9./]+"))) fps = "30"
+
+        // ---------- ২. অডিও → কাঁচা PCM (৮kHz মনো, খুব দ্রুত) ----------
+        onStatus("অডিও বিশ্লেষণ হচ্ছে… (ভিডিও যত লম্বা, তত সময়)")
+        FFmpegKitConfig.enableStatisticsCallback { st ->
+            onProgress(((st.time / 1000.0) / duration * 10).toInt().coerceIn(0, 10))
+        }
+        val pcm = File(ctx.cacheDir, "audio.pcm").apply { delete() }
+        val ex = FFmpegKit.executeWithArguments(arrayOf(
+            "-y", "-hide_banner", "-i", src(input), "-vn",
+            "-ac", "1", "-ar", "8000", "-f", "s16le", pcm.absolutePath
+        ))
+        if (!ReturnCode.isSuccess(ex.returnCode) || !pcm.exists() || pcm.length() < 1600)
+            error("অডিও পড়া যায়নি:\n" + (ex.allLogsAsString ?: "").takeLast(400))
+
+        val db = frameLevels(pcm)          // প্রতি ২০ms-এ একটি dB মান
+        pcm.delete()
+
+        // ---------- ৩. কথার অংশ খোঁজা ----------
+        val thr = noiseDb?.toFloat() ?: autoThreshold(db)
+        val segs = findSpeech(db, thr, minGap, duration)
+        if (segs.isEmpty())
+            error("কোনো কথা পাওয়া যায়নি। অটো মোডে (dB খালি) আবার চেষ্টা করুন।")
+
+        val kept = segs.sumOf { it.e - it.s }
+        onStatus("সীমা ${"%.0f".format(thr)}dB • ${segs.size}টি অংশ রাখা হবে, ${fmt(duration - kept)} বাদ যাবে")
+
+        // ---------- ৪. এক্সপোর্ট (ছোট ছোট ব্যাচে) ----------
+        val totalOut = kept + blackSec * (segs.size - 1)
+        val g = grade.toFilter()
+        val chunks = segs.chunked(CHUNK)
+        val partFiles = mutableListOf<File>()
+        var doneOut = 0.0
+
+        // আগে হার্ডওয়্যার এনকোডার; ব্যর্থ হলে পরেরটা
+        val encoders = listOf(
+            arrayOf("-c:v", "h264_mediacodec", "-b:v", if (fast720) "6M" else "10M"),
+            arrayOf("-c:v", "libx264", "-preset", "ultrafast", "-crf", "26"),
+            arrayOf("-c:v", "mpeg4", "-q:v", "4")
+        )
+        var encIdx = 0
+
+        for ((ci, chunk) in chunks.withIndex()) {
+            onStatus("এডিট ও এক্সপোর্ট হচ্ছে… (${ci + 1}/${chunks.size})")
+            val base = chunk.first().s
+            val globalStart = ci * CHUNK
+            val sb = StringBuilder()
+            var n = 0
+            for ((k, s) in chunk.withIndex()) {
+                val i = globalStart + k
+                val a = s.s - base
+                val b = s.e - base
+                sb.append("[0:v]trim=start=${f(a)}:end=${f(b)},setpts=PTS-STARTPTS")
+                sb.append(",scale=$w:$h:force_original_aspect_ratio=decrease,pad=$w:$h:(ow-iw)/2:(oh-ih)/2")
+                if (g.isNotEmpty()) sb.append(",").append(g)
+                sb.append(",fps=$fps,format=yuv420p,setsar=1[v$k];\n")
+                sb.append("[0:a]atrim=start=${f(a)}:end=${f(b)},asetpts=PTS-STARTPTS,")
+                sb.append("aformat=sample_rates=44100:channel_layouts=stereo[a$k];\n")
+                n++
+                if (i < segs.size - 1) {
+                    sb.append("color=c=black:s=${w}x$h:r=$fps:d=${f(blackSec)},format=yuv420p,setsar=1[bv$k];\n")
+                    sb.append("anullsrc=r=44100:cl=stereo,atrim=duration=${f(blackSec)},asetpts=PTS-STARTPTS[ba$k];\n")
+                    n++
+                }
+            }
+            for ((k, _) in chunk.withIndex()) {
+                sb.append("[v$k][a$k]")
+                if (globalStart + k < segs.size - 1) sb.append("[bv$k][ba$k]")
+            }
+            sb.append("concat=n=$n:v=1:a=1[v][a]")
+            val script = File(ctx.cacheDir, "filter_$ci.txt").apply { writeText(sb.toString()) }
+
+            val chunkLen = chunk.sumOf { it.e - it.s } +
+                    blackSec * (chunk.size - (if (globalStart + chunk.size >= segs.size) 1 else 0))
+            val srcSpan = chunk.last().e - base
+            val part = File(ctx.cacheDir, "part_$ci.mp4").apply { delete() }
+
+            FFmpegKitConfig.enableStatisticsCallback { st ->
+                val p = (10 + (doneOut + st.time / 1000.0) / totalOut * 89).toInt().coerceIn(10, 99)
+                onProgress(p)
+            }
+
+            var ok = false
+            while (encIdx < encoders.size) {
+                val args = arrayOf(
+                    "-y", "-hide_banner", "-threads", "0",
+                    "-ss", f(base), "-t", f(srcSpan + 0.5), "-i", src(input),
+                    "-filter_complex_script", script.absolutePath,
+                    "-map", "[v]", "-map", "[a]"
+                ) + encoders[encIdx] + arrayOf(
+                    "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", part.absolutePath
+                )
+                val session = FFmpegKit.executeWithArguments(args)
+                if (ReturnCode.isSuccess(session.returnCode) && part.exists() && part.length() > 0) {
+                    ok = true; break
+                }
+                if (encIdx == encoders.lastIndex)
+                    error("এক্সপোর্ট ব্যর্থ:\n" + (session.allLogsAsString ?: "").takeLast(600))
+                encIdx++            // পরের এনকোডার দিয়ে একই ব্যাচ আবার
+                part.delete()
+            }
+            if (!ok) error("অজানা সমস্যা")
+            script.delete()
+            partFiles += part
+            doneOut += chunkLen
+        }
+
+        // ---------- ৫. ব্যাচগুলো জোড়া লাগানো (কপি, তাই কয়েক সেকেন্ড) ----------
+        val out = File(ctx.cacheDir, "autocut_${System.currentTimeMillis()}.mp4")
+        if (partFiles.size == 1) {
+            partFiles[0].copyTo(out, overwrite = true); partFiles[0].delete()
+        } else {
+            onStatus("অংশগুলো জোড়া লাগানো হচ্ছে…")
+            val list = File(ctx.cacheDir, "list.txt")
+            list.writeText(partFiles.joinToString("\n") { "file '${it.absolutePath}'" })
+            val cc = FFmpegKit.executeWithArguments(arrayOf(
+                "-y", "-hide_banner", "-f", "concat", "-safe", "0", "-i", list.absolutePath,
+                "-c", "copy", "-movflags", "+faststart", out.absolutePath
+            ))
+            partFiles.forEach { it.delete() }; list.delete()
+            if (!ReturnCode.isSuccess(cc.returnCode))
+                error("জোড়া লাগানো ব্যর্থ:\n" + (cc.allLogsAsString ?: "").takeLast(400))
+        }
+        onProgress(100)
+        return out
+    }
+
+    // ---------------- অডিও বিশ্লেষণ ----------------
+
+    /** ২০ms উইন্ডোতে RMS লেভেল (dBFS)। */
+    private fun frameLevels(pcm: File): FloatArray {
+        val win = WIN_SAMPLES
+        val total = (pcm.length() / 2 / win).toInt()
+        val out = FloatArray(total)
+        FileInputStream(pcm).buffered(1 shl 16).use { ins ->
+            val buf = ByteArray(win * 2)
+            for (i in 0 until total) {
+                var read = 0
+                while (read < buf.size) {
+                    val r = ins.read(buf, read, buf.size - read)
+                    if (r < 0) break
+                    read += r
+                }
+                var sum = 0.0
+                for (j in 0 until win) {
+                    val v = ((buf[2 * j + 1].toInt() shl 8) or (buf[2 * j].toInt() and 0xFF)).toShort() / 32768.0
+                    sum += v * v
+                }
+                val rms = sqrt(sum / win)
+                out[i] = if (rms < 1e-6) -120f else (20 * log10(rms)).toFloat()
+            }
+        }
+        return out
+    }
+
+    /** নয়েজ ফ্লোর (নিচের ১০%) আর কথার লেভেল (উপরের ১০%) দেখে মাঝামাঝি সীমা ঠিক করে। */
+    private fun autoThreshold(db: FloatArray): Float {
+        val sorted = db.copyOf().also { it.sort() }
+        val floor = sorted[(sorted.size * 0.10).toInt().coerceIn(0, sorted.size - 1)]
+        val speech = sorted[(sorted.size * 0.90).toInt().coerceIn(0, sorted.size - 1)]
+        val gap = max(speech - floor, 0f)
+        return floor + max(6f, gap * 0.35f)
+    }
+
+    private fun findSpeech(db: FloatArray, thr: Float, minGap: Double, duration: Double): List<Seg> {
+        val step = WIN_SAMPLES / 8000.0                      // ০.০২ সেকেন্ড
+        // কথার রান
+        val runs = mutableListOf<Seg>()
+        var start = -1
+        for (i in db.indices) {
+            val voiced = db[i] > thr
+            if (voiced && start < 0) start = i
+            if (!voiced && start >= 0) { runs += Seg(start * step, i * step); start = -1 }
+        }
+        if (start >= 0) runs += Seg(start * step, db.size * step)
+
+        // খুব ছোট শব্দ (ক্লিক/খুটখাট) বাদ, তারপর ছোট ফাঁক জোড়া
+        val merged = mutableListOf<Seg>()
+        for (r in runs) {
+            if (r.e - r.s < 0.08) continue
+            val last = merged.lastOrNull()
+            if (last != null && r.s - last.e < minGap) merged[merged.lastIndex] = Seg(last.s, r.e)
+            else merged += r
+        }
+
+        // কথার আগে-পরে সামান্য প্যাডিং, যাতে শব্দ কেটে না যায়
+        val pad = min(0.12, minGap / 3)
+        val out = mutableListOf<Seg>()
+        for (m in merged) {
+            val s = max(m.s - pad, 0.0)
+            val e = min(m.e + pad, duration)
+            if (e - s < 0.2) continue
+            val last = out.lastOrNull()
+            if (last != null && s <= last.e) out[out.lastIndex] = Seg(last.s, max(last.e, e))
+            else out += Seg(s, e)
+        }
+        return out
+    }
+
+    private fun fmt(sec: Double): String {
+        val t = sec.toInt()
+        return "%d:%02d মিনিট".format(t / 60, t % 60)
+    }
+
+    companion object {
+        private const val WIN_SAMPLES = 160   // ২০ms @ 8kHz
+        private const val CHUNK = 25          // প্রতি ব্যাচে সর্বোচ্চ ২৫ অংশ
+    }
+}
