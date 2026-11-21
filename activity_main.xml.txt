@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent">
+    <LinearLayout
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="vertical" android:padding="16dp">
+
+        <Button android:id="@+id/btnVideo" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="১. ভিডিও বাছুন" />
+        <TextView android:id="@+id/tvVideo" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="কোনো ভিডিও বাছা হয়নি" />
+
+        <Button android:id="@+id/btnXml" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="২. XML ফাইল বাছুন (ঐচ্ছিক)"
+            android:layout_marginTop="12dp" />
+        <TextView android:id="@+id/tvXml" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="কালার গ্রেডিং ছাড়াই চলবে" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="নীরবতার সীমা (dB) — খালি রাখলে অটো" android:layout_marginTop="12dp" />
+        <EditText android:id="@+id/etNoise" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:inputType="numberSigned" android:hint="অটো" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="কত সেকেন্ডের বেশি গ্যাপ কাটবে" />
+        <EditText android:id="@+id/etGap" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:inputType="numberDecimal" android:text="0.5" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="প্রতি কাটে ব্ল্যাকের সময় (সেকেন্ড, ১-এর কম)" />
+        <EditText android:id="@+id/etBlack" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:inputType="numberDecimal" android:text="0.5" />
+
+        <CheckBox android:id="@+id/cbFast" android:layout_width="wrap_content"
+            android:layout_height="wrap_content" android:checked="true"
+            android:text="দ্রুত মোড (৭২০p, বেশি স্পিড)" />
+
+        <Button android:id="@+id/btnStart" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="৩. এডিট শুরু করুন"
+            android:layout_marginTop="16dp" />
+        <ProgressBar android:id="@+id/progress" style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:max="100" />
+        <TextView android:id="@+id/tvStatus" android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <VideoView android:id="@+id/videoView" android:layout_width="match_parent"
+            android:layout_height="240dp" android:layout_marginTop="12dp" />
+    </LinearLayout>
+</ScrollView>
